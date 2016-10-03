@@ -1,10 +1,8 @@
 {
 	"cniVersion": "0.3.0",
 	"name": "default",
-	"log_level": "debug",
 	"ipam": {
 		"type": "ipgen",
-		"subnet": "fd52:f6b0:3162::/64",
-		"subnets": ["10.0.0.0/8"]
+		"subnet": "fd52:f6b0:3162::/64"
 	}
 }
