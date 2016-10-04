@@ -25,24 +25,26 @@ type ipamArgs struct {
 	ContainerName containerName
 }
 
-type netconf struct {
+type netConf struct {
 	Name string `json:"name"`
 	Type string `json:"type"`
 	IPAM struct {
 		Name    string
-		Type    string   `json:"type"`
-		Subnet  string   `json:"subnet"`
-		Subnets []string `json:"subnets,omitempty"`
+		Type    string        `json:"type"`
+		Subnet  string        `json:"subnet,omitempty"`
+		Gateway net.IP        `json:"gateway,omitempty"`
+		Routes  []types.Route `json:"routes,omitempty"`
 	} `json:"ipam,omitempty"`
-	LogLevel string `json:"log_level,omitempty"`
+	LogLevel string    `json:"log_level,omitempty"`
+	DNS      types.DNS `json:"dns,omitempty"`
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
-	conf := netconf{}
+	conf := netConf{}
 	if err := json.Unmarshal(args.StdinData, &conf); err != nil {
-		return fmt.Errorf("failed to load netconf: %v", err)
+		return fmt.Errorf("failed to load config file: %v", err)
 	}
-	log.WithField("netconf", conf).Debug("Config object")
+	log.WithField("netConf", conf).Debug("Config object")
 	// Default log level
 	if conf.LogLevel == "" {
 		conf.LogLevel = "warn"
@@ -55,86 +57,70 @@ func cmdAdd(args *skel.CmdArgs) error {
 	// Print logs to stderr as per the spec
 	log.SetOutput(os.Stderr)
 	log.WithField("stdin", string(args.StdinData)).Debug("Your configuration")
-
 	ipamArgs := ipamArgs{}
 	if err := types.LoadArgs(args.Args, &ipamArgs); err != nil {
 		return err
 	}
 	log.WithField("ipamArgs", ipamArgs).Debug("Processed args")
-
-	if len(conf.IPAM.Subnets) > 2 {
-		return fmt.Errorf("Only a maximum of 2 subnets are supported; 1 for IPv4 and 1 for IPv6")
+	_, netwk, err := net.ParseCIDR(conf.IPAM.Subnet)
+	if err != nil {
+		return err
 	}
-
-	conf.IPAM.Subnets = append(conf.IPAM.Subnets, conf.IPAM.Subnet)
-
+	subnetPrefix, subnetBits := netwk.Mask.Size()
 	r := &types.Result{}
-
+	r.DNS = conf.DNS
+	var (
+		ip           net.IP
+		prefix, bits int
+	)
 	// If a specific IP address is supplied we will use it and call it a day
 	if ipamArgs.IP != nil {
-		fmt.Fprintf(os.Stderr, "Requested IP address: %v\n", ipamArgs.IP)
-		log.WithField("IP", ipamArgs.IP).Info("Assigning requested IP address")
-		if ipamArgs.IP.To4() != nil {
-			ipNetwork := net.IPNet{IP: ipamArgs.IP, Mask: net.CIDRMask(32, 32)}
-			r.IP4 = &types.IPConfig{IP: ipNetwork}
-			log.WithField("result.IP4", r.IP4).Info("Result IPv4")
+		ip = ipamArgs.IP
+		fmt.Fprintf(os.Stderr, "Requested IP address: %v\n", ip)
+		log.WithField("IP", ip).Info("Assigning requested IP address")
+		if ip.To4() != nil {
+			bits = 32
+			prefix = bits
 		} else {
-			ipNetwork := net.IPNet{IP: ipamArgs.IP, Mask: net.CIDRMask(128, 128)}
-			r.IP6 = &types.IPConfig{IP: ipNetwork}
-			log.WithField("result.IP6", r.IP6).Info("Result IPv6")
+			bits = 128
+			prefix = bits
 		}
-		return r.Print()
-	}
-
-	// Otherwise we will process the subnets supplied in the configuration file
-	for _, subnet := range conf.IPAM.Subnets {
-		if err := processSubnet(subnet, args, ipamArgs, r); err != nil {
+	} else {
+		name := string(ipamArgs.ContainerName)
+		if name == "" {
+			name = args.ContainerID
+		}
+		log.WithFields(log.Fields{
+			"name": name,
+			"cidr": conf.IPAM.Subnet,
+		}).Info("Generating IP address")
+		ip, err = ipgen.IP(name, conf.IPAM.Subnet)
+		if err != nil {
 			return err
 		}
+		fmt.Fprintf(os.Stderr, "IPGen generated IP address: %s\n", ip)
+		prefix = subnetPrefix
+		bits = subnetBits
 	}
-
-	return r.Print()
-}
-
-func processSubnet(subnet string, args *skel.CmdArgs, ipamArgs ipamArgs, r *types.Result) error {
-	log.WithField("subnet", subnet).Debug("Processing subnet")
-	ip, netwk, err := net.ParseCIDR(subnet)
-	if err != nil {
-		return err
-	}
-
-	prefix, bits := netwk.Mask.Size()
-
-	if bits == 32 && r.IP4 != nil {
-		return fmt.Errorf("Only a maximum of 1 IPv4 address is supported.")
-	} else if bits == 64 && r.IP6 != nil {
-		return fmt.Errorf("Only a maximum of 1 IPv6 address is supported.")
-	}
-
-	name := string(ipamArgs.ContainerName)
-	if name == "" {
-		name = args.ContainerID
-	}
-
-	log.WithFields(log.Fields{
-		"name": name,
-		"cidr": subnet,
-	}).Info("Generating IP address")
-
-	ip, err = ipgen.IP(name, subnet)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "IPGen generated IP address: %s\n", ip)
 	ipNetwork := net.IPNet{IP: ip, Mask: net.CIDRMask(prefix, bits)}
 	if bits == 32 {
 		r.IP4 = &types.IPConfig{IP: ipNetwork}
 		log.WithField("result.IP4", r.IP4).Info("Result IPv4")
+		// Only configure gateway and routes if the IP is of the same
+		// type as the network
+		if subnetBits == bits {
+			r.IP4.Gateway = conf.IPAM.Gateway
+			r.IP4.Routes = conf.IPAM.Routes
+		}
 	} else {
 		r.IP6 = &types.IPConfig{IP: ipNetwork}
 		log.WithField("result.IP6", r.IP6).Info("Result IPv6")
+		if subnetBits == bits {
+			r.IP6.Gateway = conf.IPAM.Gateway
+			r.IP6.Routes = conf.IPAM.Routes
+		}
 	}
-	return nil
+	return r.Print()
 }
 
 func cmdDel(args *skel.CmdArgs) error {
